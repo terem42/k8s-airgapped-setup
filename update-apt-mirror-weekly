@@ -1,0 +1,193 @@
+#!/bin/bash
+set -e
+
+# ==============================================
+# Air-Gap Mirror Weekly Update Script
+# ==============================================
+# Runs the mirror generation and updates nginx
+# ==============================================
+
+LOG_FILE="/var/log/airgap-mirror.log"
+LOCK_FILE="/var/run/airgap-mirror-update.lock"
+
+exec >> "$LOG_FILE" 2>&1
+echo "=== $(date '+%Y-%m-%d %H:%M:%S') Air-gap mirror update started ==="
+
+# Error handling
+error_exit() {
+    echo "ERROR: $1" >&2
+    rm -f "$LOCK_FILE"
+    exit 1
+}
+
+# Check lock
+if [ -e "$LOCK_FILE" ]; then
+    lock_pid=$(cat "$LOCK_FILE" 2>/dev/null)
+    if ps -p "$lock_pid" > /dev/null 2>&1; then
+        echo "Another update is already running (PID: $lock_pid)"
+        exit 0
+    else
+        echo "WARNING: Stale lock file found, removing..."
+        rm -f "$LOCK_FILE"
+    fi
+fi
+
+echo $$ > "$LOCK_FILE"
+trap 'rm -f "$LOCK_FILE"' EXIT
+
+# Load configuration
+if [ -f /etc/apt-mirror-config.sh ]; then
+    source /etc/apt-mirror-config.sh
+else
+    error_exit "Configuration file /etc/apt-mirror-config.sh not found. Run setup-apt-mirror-ubuntu first."
+fi
+
+# Check requirements
+echo "Checking requirements..."
+for cmd in mmdebstrap wget dpkg-scanpackages gpg; do
+    if ! command -v "$cmd" &>/dev/null; then
+        echo "Installing $cmd..."
+        apt-get update && apt-get install -y mmdebstrap dpkg-dev wget gnupg
+        break
+    fi
+done
+
+# ==============================================
+# RUN MIRROR GENERATION
+# ==============================================
+
+MIRROR_SCRIPT="/usr/local/bin/generate-airgap-mirror.sh"
+
+if [ ! -f "$MIRROR_SCRIPT" ] || [ ! -x "$MIRROR_SCRIPT" ]; then
+    error_exit "Mirror generation script not found: $MIRROR_SCRIPT"
+fi
+
+echo ""
+echo "=== Running air-gap mirror generation ==="
+
+if "$MIRROR_SCRIPT"; then
+    echo "[OK] Mirror generation completed successfully"
+else
+    echo "[ERROR] Mirror generation failed"
+fi
+
+# ==============================================
+# UPDATE NGINX SYMLINKS
+# ==============================================
+
+echo ""
+echo "=== Updating nginx configuration ==="
+
+mirror_dir=$(get_mirror_dir)
+nginx_path="$NGINX_ROOT/$MIRROR_PREFIX"
+
+if [ -d "$mirror_dir" ]; then
+    mkdir -p "$(dirname "$nginx_path")"
+    ln -sfn "$mirror_dir" "$nginx_path"
+    echo "[OK] Created symlink: $nginx_path -> $mirror_dir"
+fi
+
+# ==============================================
+# GENERATE INDEX PAGE
+# ==============================================
+
+echo "Generating repository index page..."
+index_file="$NGINX_ROOT/index.html"
+
+SERVER_NAME=$(ip -o -4 addr show | awk '$2!="lo"{split($4,a,"/"); print a[1]; exit}')
+CURRENT_DATE=$(date)
+MIRROR_DIR=$(get_mirror_dir)
+PKG_COUNT=$(find "$MIRROR_DIR/amd64" -name "*.deb" 2>/dev/null | wc -l)
+MIRROR_SIZE=$(du -shL "$MIRROR_DIR" 2>/dev/null | cut -f1)
+
+cat > "$index_file" <<HTML_EOF
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Air-Gap Mirror</title>
+    <meta charset="utf-8">
+    <style>
+        body { font-family: Arial, sans-serif; margin: 40px; line-height: 1.6; color: #333; }
+        h1 { color: #2c3e50; border-bottom: 2px solid #3498db; padding-bottom: 10px; }
+        .container { max-width: 800px; margin: 0 auto; background: #f9f9f9; padding: 30px; border-radius: 10px; }
+        .stats { background: #e8f4fc; padding: 15px; border-radius: 5px; margin-bottom: 20px; }
+        .usage { background: #f0f7ff; padding: 20px; border-radius: 5px; border-left: 4px solid #2980b9; }
+        pre { background: white; padding: 10px; border-radius: 3px; overflow-x: auto; }
+        a { color: #2980b9; text-decoration: none; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Air-Gap Mirror Server</h1>
+        
+        <div class="stats">
+            <strong>Server:</strong> $SERVER_NAME<br>
+            <strong>Last Updated:</strong> $CURRENT_DATE<br>
+            <strong>Packages:</strong> $PKG_COUNT<br>
+            <strong>Mirror Size:</strong> $MIRROR_SIZE
+        </div>
+        
+        <p>Available repository: <a href="/$MIRROR_PREFIX/">/$MIRROR_PREFIX/</a></p>
+        
+        <div class="usage">
+            <h3>Network Client Configuration</h3>
+            <pre>
+# Download and install the GPG key
+curl -fsSL http://$SERVER_NAME/$MIRROR_PREFIX/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/airgap.gpg
+
+# Add the repository
+echo "deb [signed-by=/etc/apt/keyrings/airgap.gpg] http://$SERVER_NAME/$MIRROR_PREFIX/ stable main" | sudo tee /etc/apt/sources.list.d/airgap.list
+
+# Update apt
+sudo apt update
+            </pre>
+        </div>
+        
+        <div class="usage" style="margin-top: 20px; border-left-color: #27ae60;">
+            <h3>USB Flash Drive (Offline) Usage</h3>
+            <pre>
+# 1. Copy mirror to USB drive
+rsync -av /var/cache/airgap-mirror/$MIRROR_PREFIX/ /media/usb/$MIRROR_PREFIX/
+
+# 2. On air-gapped system, mount USB and install GPG key
+mount /dev/sdb1 /mnt/usb
+sudo cp /mnt/usb/$MIRROR_PREFIX/Release.key /tmp/
+sudo gpg --dearmor -o /etc/apt/keyrings/airgap.gpg /tmp/Release.key
+
+# 3. Add repository using file:// protocol
+echo "deb [signed-by=/etc/apt/keyrings/airgap.gpg] file:///mnt/usb/$MIRROR_PREFIX/ stable main" | sudo tee /etc/apt/sources.list.d/airgap.list
+
+# 4. Update apt
+sudo apt update
+            </pre>
+        </div>
+        
+        <p style="color: #7f8c8d; font-size: 0.9em; margin-top: 30px;">
+            This mirror contains packages for: Ubuntu $UBUNTU_CODENAME base system, 
+            Linux kernel, ZFS, Kubernetes v$K8S_VERSION, and CRI-O v$CRIO_VERSION
+        </p>
+    </div>
+</body>
+</html>
+HTML_EOF
+
+echo "[OK] Index page generated: $index_file"
+
+# ==============================================
+# RELOAD NGINX
+# ==============================================
+
+echo "Testing nginx configuration..."
+if nginx -t 2>&1; then
+    echo "[OK] Nginx configuration test passed"
+    if systemctl reload nginx 2>&1; then
+        echo "[OK] Nginx reloaded successfully"
+    else
+        echo "[WARN] Failed to reload nginx"
+    fi
+else
+    echo "[WARN] Nginx configuration test failed"
+fi
+
+echo ""
+echo "=== $(date '+%Y-%m-%d %H:%M:%S') Air-gap mirror update completed ==="

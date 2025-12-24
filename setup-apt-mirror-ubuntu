@@ -1,0 +1,297 @@
+#!/bin/bash
+set -e
+
+# ==============================================
+# Air-Gap Mirror Setup Script
+# ==============================================
+
+# Get the directory where this script is located
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+echo "=== Air-Gap Mirror Setup ==="
+echo "Script directory: $SCRIPT_DIR"
+echo ""
+
+# ==============================================
+# INSTALL CONFIGURATION FILE
+# ==============================================
+
+CONFIG_SOURCE="$SCRIPT_DIR/apt-mirror-config.sh"
+CONFIG_DEST="/etc/apt-mirror-config.sh"
+
+if [ ! -f "$CONFIG_SOURCE" ]; then
+    echo "[ERROR] Configuration file not found: $CONFIG_SOURCE"
+    exit 1
+fi
+
+cp "$CONFIG_SOURCE" "$CONFIG_DEST"
+chmod 644 "$CONFIG_DEST"
+echo "[OK] Configuration copied to: $CONFIG_DEST"
+
+# Source the configuration
+source "$CONFIG_DEST"
+echo "[OK] Configuration loaded"
+echo ""
+
+# ==============================================
+# SHOW CONFIGURATION
+# ==============================================
+
+show_config() {
+    echo "Configuration Summary:"
+    echo "======================"
+    echo "Mirror root: $MIRROR_ROOT"
+    echo "Mirror prefix: $MIRROR_PREFIX"
+    echo "Nginx root: $NGINX_ROOT"
+    echo "Ubuntu codename: $UBUNTU_CODENAME"
+    echo "Kubernetes version: $K8S_VERSION"
+    echo "CRI-O version: $CRIO_VERSION"
+    echo ""
+    echo "Package manifest:"
+    echo "  Bootstrap packages: ${#BOOTSTRAP_PACKAGES[@]}"
+    echo "  System packages: ${#SYSTEM_PACKAGES[@]}"
+    echo "  ZFS packages: ${#ZFS_PACKAGES[@]}"
+    echo "  K8s packages: ${#K8S_PACKAGES[@]}"
+    echo "  CRI-O packages: ${#CRIO_PACKAGES[@]}"
+    echo ""
+}
+
+show_config
+
+# ==============================================
+# INSTALL REQUIRED PACKAGES
+# ==============================================
+
+install_if_missing() {
+    local package="$1"
+    if ! dpkg -l | grep -q "^ii.*$package"; then
+        echo "Installing $package..."
+        apt-get update -qq
+        apt-get install -y "$package"
+        echo "[OK] Installed $package"
+    else
+        echo "[OK] $package is already installed"
+    fi
+}
+
+echo "Installing required packages..."
+echo "-------------------------------"
+
+# Core requirements for mirror generation
+install_if_missing "mmdebstrap"
+install_if_missing "dpkg-dev"      # for dpkg-scanpackages
+install_if_missing "wget"
+install_if_missing "gnupg"
+install_if_missing "curl"
+
+# Web server
+install_if_missing "nginx"
+
+echo ""
+echo "All required packages installed."
+echo ""
+
+# ==============================================
+# CREATE DIRECTORY STRUCTURE
+# ==============================================
+
+echo "Creating directory structure..."
+
+mkdir -p "$MIRROR_ROOT/mirror/$MIRROR_PREFIX/amd64"
+mkdir -p "$NGINX_ROOT"
+mkdir -p "$(dirname "$GPG_KEY_PATH")"
+mkdir -p "/var/log"
+
+echo "[OK] Directory structure created"
+
+# ==============================================
+# GENERATE NGINX CONFIGURATION
+# ==============================================
+
+echo "Generating nginx configuration..."
+
+cat > /etc/nginx/sites-available/apt-mirror << 'NGINX_EOF'
+server {
+    listen 80;
+    server_name _;
+    
+    root /var/www/html;
+    autoindex on;
+    
+    # Security headers
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    
+    # Compression
+    gzip on;
+    gzip_vary on;
+    gzip_min_length 1024;
+    gzip_types text/plain text/css application/json application/javascript;
+    
+    # Cache .deb files for 90 days
+    location ~* \.deb$ {
+        expires 90d;
+        add_header Cache-Control "public, immutable";
+    }
+    
+    # Cache metadata for 10 minutes
+    location ~* \.(Packages|Release|InRelease)$ {
+        expires 10m;
+        add_header Cache-Control "public, must-revalidate";
+    }
+    
+    # Logging
+    access_log /var/log/nginx/apt-mirror-access.log;
+    error_log /var/log/nginx/apt-mirror-error.log warn;
+    
+    # Health check
+    location /health {
+        access_log off;
+        return 200 "healthy\n";
+    }
+}
+NGINX_EOF
+
+echo "[OK] Nginx configuration written"
+
+# Enable nginx site
+ln -sf /etc/nginx/sites-available/apt-mirror /etc/nginx/sites-enabled/
+rm -f /etc/nginx/sites-enabled/default
+
+# Test and reload nginx
+if nginx -t 2>&1; then
+    systemctl reload nginx
+    echo "[OK] Nginx configured and reloaded"
+else
+    echo "[ERROR] Nginx configuration test failed"
+    exit 1
+fi
+
+# ==============================================
+# INSTALL SCRIPTS
+# ==============================================
+
+echo "Installing scripts..."
+
+# Install generate-airgap-mirror.sh
+if [ -f "$SCRIPT_DIR/generate-airgap-mirror.sh" ]; then
+    cp "$SCRIPT_DIR/generate-airgap-mirror.sh" /usr/local/bin/
+    chmod +x /usr/local/bin/generate-airgap-mirror.sh
+    echo "[OK] generate-airgap-mirror.sh installed"
+else
+    echo "[ERROR] generate-airgap-mirror.sh not found in $SCRIPT_DIR"
+    exit 1
+fi
+
+# Install update-apt-mirror-weekly
+if [ -f "$SCRIPT_DIR/update-apt-mirror-weekly" ]; then
+    cp "$SCRIPT_DIR/update-apt-mirror-weekly" /usr/local/bin/
+    chmod +x /usr/local/bin/update-apt-mirror-weekly
+    echo "[OK] update-apt-mirror-weekly installed"
+else
+    echo "[ERROR] update-apt-mirror-weekly not found in $SCRIPT_DIR"
+    exit 1
+fi
+
+# ==============================================
+# GENERATE GPG KEY
+# ==============================================
+
+echo "Generating GPG key..."
+if generate_gpg_key; then
+    echo "[OK] GPG key generated"
+else
+    echo "[WARN] GPG key generation failed or already exists"
+fi
+
+# ==============================================
+# CREATE SYSTEMD SERVICE AND TIMER
+# ==============================================
+
+echo "Creating systemd service..."
+
+cat > /etc/systemd/system/apt-mirror-weekly.service << 'SERVICE_EOF'
+[Unit]
+Description=Weekly Air-Gap Mirror Updates
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/update-apt-mirror-weekly
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=airgap-mirror
+TimeoutStopSec=10800
+Nice=19
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=multi-user.target
+SERVICE_EOF
+
+cat > /etc/systemd/system/apt-mirror-weekly.timer << 'TIMER_EOF'
+[Unit]
+Description=Weekly Air-Gap Mirror Updates Timer
+
+[Timer]
+OnCalendar=weekly
+Persistent=true
+RandomizedDelaySec=3600
+
+[Install]
+WantedBy=timers.target
+TIMER_EOF
+
+systemctl daemon-reload
+systemctl enable apt-mirror-weekly.timer
+systemctl start apt-mirror-weekly.timer
+
+echo "[OK] Systemd timer configured"
+
+# ==============================================
+# CREATE LOG ROTATION
+# ==============================================
+
+cat > /etc/logrotate.d/airgap-mirror << 'LOGROTATE_EOF'
+/var/log/airgap-mirror.log {
+    weekly
+    rotate 8
+    compress
+    delaycompress
+    missingok
+    notifempty
+}
+LOGROTATE_EOF
+
+touch "$LOG_FILE"
+chmod 644 "$LOG_FILE"
+
+echo "[OK] Log rotation configured"
+
+# ==============================================
+# FINAL SUMMARY
+# ==============================================
+
+echo ""
+echo "=== Setup Complete ==="
+echo ""
+echo "To run initial mirror generation:"
+echo "  sudo /usr/local/bin/update-apt-mirror-weekly"
+echo ""
+echo "Or for a dry-run (preview what will be downloaded):"
+echo "  sudo /usr/local/bin/generate-airgap-mirror.sh --dry-run"
+echo ""
+echo "Scheduled updates: weekly via systemd timer"
+echo "Check timer status:"
+echo "  systemctl status apt-mirror-weekly.timer"
+echo ""
+echo "View logs:"
+echo "  tail -f $LOG_FILE"
+echo ""
+
+SERVER_IP=$(hostname -I | awk '{print $1}')
+echo "Client configuration (after first mirror generation):"
+echo "  curl -fsSL http://$SERVER_IP/$MIRROR_PREFIX/Release.key | gpg --dearmor -o /etc/apt/keyrings/airgap.gpg"
+echo "  echo 'deb [signed-by=/etc/apt/keyrings/airgap.gpg] http://$SERVER_IP/$MIRROR_PREFIX/ stable main' > /etc/apt/sources.list.d/airgap.list"
+echo ""
